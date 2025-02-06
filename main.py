@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import cloudinary
 import cloudinary.uploader
 from fastapi.encoders import jsonable_encoder
+from pymongo import DESCENDING
 
 load_dotenv()
 
@@ -126,7 +127,6 @@ def get_admin_user(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-
 # Auth Routes
 @app.post("/token")
 def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -143,7 +143,6 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = jwt.encode({"sub": str(user["_id"])}, SECRET_KEY, algorithm=ALGORITHM)
     return {"access_token": access_token, "token_type": "bearer", "role": "admin" if "email" in user else "student"}
-
 
 
 @app.post("/register/student/")
@@ -220,6 +219,28 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 
 
 # Election Routes
+
+@app.get("/latest-election")
+def get_latest_election():
+    collection = db["elections"]
+    latest_election = collection.find_one(
+        sort=[("start_time", -1)])  # Assuming you're sorting by start_time to get the latest election
+
+    if not latest_election:
+        raise HTTPException(status_code=404, detail="No elections found")
+
+    # Convert ObjectId to string for serializability
+    latest_election["_id"] = str(latest_election["_id"])
+
+    election_session = latest_election.get("session", "No session available")  # Use .get() to avoid KeyError
+
+    return {
+        "id": latest_election["_id"],
+        "session": election_session,
+        "start_time": latest_election["start_time"],
+        "end_time": latest_election["end_time"],
+    }
+
 @app.post("/elections/")
 def create_election(election: Election, admin: dict = Depends(get_admin_user)):
     election_id = db.elections.insert_one(election.dict()).inserted_id
@@ -236,6 +257,7 @@ def get_elections():
         election["_id"] = str(election["_id"])
 
     return jsonable_encoder(elections)
+
 
 @app.delete("/elections/{election_id}")
 def delete_election(election_id: str):
@@ -256,73 +278,89 @@ def get_election_positions():
 
 
 @app.post("/election-positions/")
-def add_election_positions(session: str, positions: List[str]):
-    collection = db["elections"]
-    election_id = collection.insert_one({"session": session, "positions": positions}).inserted_id
-    return {"id": str(election_id)}
+def add_election_positions(election_id: str, positions: List[str]):
+    result = db.elections.update_one(
+        {"_id": ObjectId(election_id)},
+        {"$addToSet": {"positions": {"$each": positions}}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Election not found")
+    return {"message": "Positions added successfully"}
 
 
-@app.get("/position-candidates/{position}")
-async def get_position_candidates(position: str):
-    try:
-        # Case-insensitive search for positions containing the query
-        candidates = db.candidates.find({"position": {"$regex": position, "$options": "i"}})
-
-        # Convert ObjectId to string before returning response
-        result = []
-        for candidate in candidates:
-            candidate["_id"] = str(candidate["_id"])  # Convert ObjectId to string
-            result.append(candidate)
-
-        if not result:
-            raise HTTPException(status_code=404, detail="No candidates found")
-
-        return jsonable_encoder(result)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/position-candidates/{election_id}/{position}")
+def get_position_candidates(election_id: str, position: str):
+    candidates = list(db.candidates.find({"election_id": election_id, "position": position}))
+    for candidate in candidates:
+        candidate["_id"] = str(candidate["_id"])
+    return jsonable_encoder(candidates)
 
 
-@app.get("/position-results/{position}")
-def get_position_result(position: str):
-    votes_collection = db["votes"]
-    candidates_collection = db["candidates"]
+@app.get("/positions/{election_id}")
+def get_positions(election_id: str):
+    election = db.elections.find_one({"_id": ObjectId(election_id)})
 
-    votes = list(votes_collection.find({"position": position}))
-    results = {}
+    if not election:
+        raise HTTPException(status_code=404, detail="Election not found")
+
+    # Return positions available in the election
+    return {"positions": election.get("positions", [])}
+
+
+
+@app.get("/get_position_result/{election_id}/{position}")
+def get_position_result(election_id: str, position: str):
+    votes = list(db.votes.aggregate([
+        {"$match": {"election_id": election_id, "position": position}},
+        {"$group": {"_id": "$candidate_id", "count": {"$sum": 1}}},
+        {"$sort": {"count": DESCENDING}}
+    ]))
+
+    results = []
     for vote in votes:
-        candidate_id = str(vote["candidate_id"])
-        results[candidate_id] = results.get(candidate_id, 0) + 1
+        candidate = db.candidates.find_one({"_id": ObjectId(vote["_id"])})
+        if candidate:
+            results.append({
+                "candidate_id": vote["_id"],
+                "candidate_name": candidate["name"],
+                "vote_count": vote["count"]
+            })
 
-    candidates = {str(c["_id"]): c["name"] for c in candidates_collection.find({"position": position})}
-
-    return {candidates[c_id]: count for c_id, count in results.items()}
+    return jsonable_encoder(results)
 
 
 # Candidate Routes
+# Candidate Routes
 @app.post("/candidates/")
 def create_candidate(
-    election_id: str = Form(...),
-    name: str = Form(...),
-    position: str = Form(...),
-    short_description: str = Form(...),
-    accomplishments: str = Form(...),
-    manifesto: str = Form(...),
-    image: UploadFile = File(...)
+        election_id: str = Form(...),
+        name: str = Form(...),
+        position: str = Form(...),
+        short_description: str = Form(...),
+        accomplishments: List[str] = Form(...),  # Expecting a list of strings
+        manifesto: str = Form(...),
+        image: UploadFile = File(...),
+        admin: dict = Depends(get_admin_user)
 ):
+    # Upload image to Cloudinary
     collection = db["candidates"]
     result = cloudinary.uploader.upload(image.file)
     image_url = result["secure_url"]
+
+    # Create candidate data
     candidate_data = {
         "election_id": election_id,
         "name": name,
         "position": position,
         "image_url": image_url,
         "short_description": short_description,
-        "accomplishments": accomplishments.split(","),
+        "accomplishments": accomplishments,  # Now directly a list of strings
         "manifesto": manifesto
     }
+
+    # Insert candidate data into MongoDB
     candidate_id = collection.insert_one(candidate_data).inserted_id
+
     return {"id": str(candidate_id)}
 
 
@@ -343,7 +381,6 @@ def get_candidate_profile(candidate_id: str):
 
     candidate["_id"] = str(candidate["_id"])  # Convert ObjectId to string
     return candidate
-
 
 
 @app.put("/candidates/{candidate_id}")
@@ -367,10 +404,21 @@ def delete_candidate(candidate_id: str):
 # Voting Routes
 @app.post("/votes/")
 def cast_vote(vote: Vote, student: dict = Depends(get_current_user)):
-    existing_vote = db.votes.find_one({"election_id": vote.election_id, "voter_id": student["matric_no"]})
+    # Check if the voter has already voted for this position in the same election
+    existing_vote = db.votes.find_one({
+        "election_id": vote.election_id,
+        "voter_id": student["matric_no"],
+        "position": vote.position  # Ensure position uniqueness
+    })
+
     if existing_vote:
-        raise HTTPException(status_code=400, detail="Voter has already voted.")
-    vote_id = db.votes.insert_one(vote.dict()).inserted_id
+        raise HTTPException(status_code=400, detail="Voter has already voted for this position.")
+
+    # Insert the vote
+    vote_data = vote.dict()
+    vote_data["voter_id"] = student["matric_no"]  # Ensure voter identity is stored
+    vote_id = db.votes.insert_one(vote_data).inserted_id
+
     return {"id": str(vote_id)}
 
 
@@ -382,15 +430,60 @@ def get_results(election_id: str):
         raise HTTPException(status_code=404, detail="Election not found")
 
     results = {}
+
+    # Loop through all positions and aggregate votes for each
     for position in election.get("positions", []):
+        # Aggregate votes for each candidate under this position
         candidates = list(db.votes.aggregate([
-            {"$match": {"election_id": str(election_id), "position": position}},  # Ensure election_id is a string
-            {"$group": {"_id": "$candidate_id", "votes": {"$sum": 1}}},
-            {"$sort": {"votes": -1}}
+            {"$match": {"election_id": election_id, "position": position}},  # Match votes for the position
+            {"$group": {"_id": "$candidate_id", "votes": {"$sum": 1}}},  # Group by candidate and count votes
+            {"$lookup": {
+                "from": "candidates",  # Join with candidates collection
+                "localField": "_id",  # Use the candidate_id from votes
+                "foreignField": "_id",  # Match it with the _id in the candidates collection
+                "as": "candidate_details"  # Store matched candidate details in 'candidate_details'
+            }},
+            {"$unwind": "$candidate_details"},  # Flatten the candidate details
+            {"$project": {
+                "candidate_id": "$_id",
+                "votes": 1,
+                "name": "$candidate_details.name",  # Extract the candidate name
+                "image_url": "$candidate_details.image_url"  # Extract the candidate image URL
+            }},
+            {"$sort": {"votes": -1}}  # Sort by number of votes in descending order
         ]))
+
         results[position] = candidates
 
     return results
+
+
+@app.get("/election-results/{election_id}")
+def get_election_results(election_id: str):
+    # Aggregate votes grouped by position and candidate, sorted by highest votes first
+    votes = list(db.votes.aggregate([
+        {"$match": {"election_id": election_id}},
+        {"$group": {"_id": {"position": "$position", "candidate_id": "$candidate_id"}, "count": {"$sum": 1}}},
+        {"$sort": {"_id.position": 1, "count": -1}}
+    ]))
+
+    results = {}
+    for vote in votes:
+        position = vote["_id"]["position"]
+        candidate_id = vote["_id"]["candidate_id"]
+        candidate = db.candidates.find_one({"_id": ObjectId(candidate_id)})
+
+        if candidate:
+            candidate_result = {
+                "candidate_id": candidate_id,
+                "candidate_name": candidate["name"],
+                "vote_count": vote["count"]
+            }
+            if position not in results:
+                results[position] = []
+            results[position].append(candidate_result)
+
+    return jsonable_encoder(results)
 
 
 # Timed Candidate Rotation
@@ -410,41 +503,58 @@ def candidates_of_the_hour(election_id: str):
     return selected
 
 
-@app.get("/votes/by-department/{department}")
-def get_votes_by_department(department: str):
+@app.get("/votes/by-department/{election_id}/{department}")
+def get_votes_by_department(election_id: str, department: str):
     collection = db["votes"]
-    votes = list(collection.find({"department": department}))
+    votes = list(collection.find({"election_id": election_id, "department": department}))
+
+    if not votes:
+        raise HTTPException(status_code=404, detail="No votes found for this department in the given election")
+
     return votes
 
 
-@app.get("/votes/top-candidates")
-def get_top_candidates():
+@app.get("/votes/top-candidates/{election_id}")
+def get_top_candidates(election_id: str):
     collection = db["votes"]
     pipeline = [
-        {"$group": {"_id": "$candidate_id", "votes": {"$sum": 1}, "position": {"$first": "$position"}}},
-        {"$sort": {"votes": -1}},
-        {"$group": {"_id": "$position", "top_candidate": {"$first": "$$ROOT"}}},
+        {"$match": {"election_id": election_id}},  # Filter by election_id
+        {"$group": {
+            "_id": "$candidate_id",
+            "votes": {"$sum": 1},
+            "position": {"$first": "$position"},
+            "election_id": {"$first": "$election_id"}
+        }},
+        {"$sort": {"votes": -1}},  # Sort by votes
+        {"$group": {
+            "_id": "$position",
+            "top_candidate": {"$first": "$$ROOT"}
+        }},
         {"$replaceRoot": {"newRoot": "$top_candidate"}}
     ]
     results = list(collection.aggregate(pipeline))
+
+    if not results:
+        raise HTTPException(status_code=404, detail="No top candidates found for this election")
+
     return results
 
 
+# Announcement Routes
 @app.post("/announcements/")
-def create_announcement(announcement: Announcement):
+def create_announcement(announcement: Announcement, election_id: str):
     collection = db["announcements"]
-    announcement_id = collection.insert_one(announcement.dict()).inserted_id
+    announcement_data = {**announcement.dict(), "election_id": election_id}
+    announcement_id = collection.insert_one(announcement_data).inserted_id
     return {"id": str(announcement_id)}
 
 
-@app.get("/announcements/")
-def get_announcements():
+@app.get("/announcements/{election_id}")
+def get_announcements(election_id: str):
     collection = db["announcements"]
-    announcements = list(collection.find())
+    announcements = list(collection.find({"election_id": election_id}))
 
-    # Convert each MongoDB document properly
     return [{"id": str(a["_id"]), **{k: v for k, v in a.items() if k != "_id"}} for a in announcements]
-
 
 
 @app.delete("/announcements/{announcement_id}")
