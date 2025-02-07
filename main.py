@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, F
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pymongo import MongoClient
 from passlib.context import CryptContext
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
 from pydantic import BaseModel
 from typing import List, Optional
@@ -127,6 +127,19 @@ def get_admin_user(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+elections = {}
+
+
+def get_election_status(election: Election):
+    current_time = datetime.utcnow()
+    if current_time < election.start_time:
+        return "not started"
+    elif election.start_time <= current_time <= election.end_time:
+        return "ongoing"
+    else:
+        return "ended"
+
+
 # Auth Routes
 @app.post("/token")
 def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -241,10 +254,33 @@ def get_latest_election():
         "end_time": latest_election["end_time"],
     }
 
+
 @app.post("/elections/")
-def create_election(election: Election, admin: dict = Depends(get_admin_user)):
-    election_id = db.elections.insert_one(election.dict()).inserted_id
+def create_election(election: Election):
+    election_data = election.dict()
+    election_data["created_at"] = datetime.utcnow()
+    election_id = db.elections.insert_one(election_data).inserted_id
     return {"id": str(election_id)}
+
+
+@app.get("/election-status/{election_id}")
+def get_election_status(election_id: str):
+    election = db.elections.find_one({"_id": ObjectId(election_id)})
+    if not election:
+        raise HTTPException(status_code=404, detail="Election not found")
+
+    now = datetime.utcnow()
+    start_time = election["start_time"]
+    end_time = election["end_time"]
+
+    if now < start_time:
+        status = "upcoming"
+    elif start_time <= now <= end_time:
+        status = "ongoing"
+    else:
+        status = "ended"
+
+    return {"status": status, "start_time": start_time, "end_time": end_time}
 
 
 @app.get("/elections/")
@@ -404,6 +440,17 @@ def delete_candidate(candidate_id: str):
 # Voting Routes
 @app.post("/votes/")
 def cast_vote(vote: Vote, student: dict = Depends(get_current_user)):
+    # Fetch election details to check status
+    election = db.elections.find_one({"_id": ObjectId(vote.election_id)})
+    if not election:
+        raise HTTPException(status_code=404, detail="Election not found.")
+
+    current_time = datetime.utcnow()
+    if current_time < election["start_time"]:
+        raise HTTPException(status_code=400, detail="Election has not started yet.")
+    if current_time > election["end_time"]:
+        raise HTTPException(status_code=400, detail="Election has ended.")
+
     # Check if the voter has already voted for this position in the same election
     existing_vote = db.votes.find_one({
         "election_id": vote.election_id,
@@ -420,6 +467,53 @@ def cast_vote(vote: Vote, student: dict = Depends(get_current_user)):
     vote_id = db.votes.insert_one(vote_data).inserted_id
 
     return {"id": str(vote_id)}
+
+
+@app.get("/election-timer/{election_id}")
+def get_election_timer(election_id: str):
+    try:
+        election = db.elections.find_one({"_id": ObjectId(election_id)})
+
+        if not election:
+            raise HTTPException(status_code=404, detail="Election not found.")
+
+        current_time = datetime.now(timezone.utc)
+
+        start_time = election.get("start_time")
+        end_time = election.get("end_time")
+
+        # Ensure start_time and end_time exist
+        if not start_time or not end_time:
+            raise HTTPException(status_code=500, detail="Missing election time data.")
+
+        # Convert MongoDB datetime to timezone-aware UTC
+        if isinstance(start_time, datetime):
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        if isinstance(end_time, datetime):
+            end_time = end_time.replace(tzinfo=timezone.utc)
+
+        # Determine election phase and countdown
+        if current_time < start_time:
+            phase = "Before Election"
+            time_remaining = max(0, (start_time - current_time).total_seconds())
+            target_date = start_time.isoformat()
+        elif current_time < end_time:
+            phase = "During Election"
+            time_remaining = max(0, (end_time - current_time).total_seconds())
+            target_date = end_time.isoformat()
+        else:
+            phase = "Election Ended"
+            time_remaining = 0
+            target_date = end_time.isoformat()
+
+        return {
+            "phase": phase,
+            "targetDate": target_date,
+            "timeRemaining": time_remaining
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/results/{election_id}")
