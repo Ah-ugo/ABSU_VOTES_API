@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, Form
+from fastapi import FastAPI, Depends, HTTPException, status, File, Path, UploadFile, Form
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pymongo import MongoClient
 from passlib.context import CryptContext
@@ -83,6 +83,17 @@ class Announcement(BaseModel):
     title: str
     message: str
     created_at: datetime = datetime.utcnow()
+
+
+def convert_objectid(data):
+    """ Recursively convert ObjectId fields in a dictionary or list to strings. """
+    if isinstance(data, dict):
+        return {key: convert_objectid(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [convert_objectid(item) for item in data]
+    elif isinstance(data, ObjectId):
+        return str(data)
+    return data
 
 
 # Hashing passwords
@@ -469,6 +480,18 @@ def cast_vote(vote: Vote, student: dict = Depends(get_current_user)):
     return {"id": str(vote_id)}
 
 
+# FastAPI endpoint example
+@app.get("/has-voted/{election_id}/{voter_id:path}/{candidate_id}")
+def has_voted(election_id: str, voter_id: str, candidate_id: str):
+    vote = db.votes.find_one({
+        "election_id": election_id,
+        "voter_id": voter_id,
+        "candidate_id": candidate_id
+    })
+
+    return {"voted": bool(vote)}
+
+
 @app.get("/election-timer/{election_id}")
 def get_election_timer(election_id: str):
     try:
@@ -518,38 +541,44 @@ def get_election_timer(election_id: str):
 
 @app.get("/results/{election_id}")
 def get_results(election_id: str):
-    election = db.elections.find_one({"_id": ObjectId(election_id)})
+    """Fetch election results grouped by position"""
 
-    if not election:
-        raise HTTPException(status_code=404, detail="Election not found")
+    existing_votes = list(db.votes.find({"election_id": election_id}))
 
-    results = {}
+    if not existing_votes:
+        raise HTTPException(status_code=404, detail="No votes found for this election.")
 
-    # Loop through all positions and aggregate votes for each
-    for position in election.get("positions", []):
-        # Aggregate votes for each candidate under this position
-        candidates = list(db.votes.aggregate([
-            {"$match": {"election_id": election_id, "position": position}},  # Match votes for the position
-            {"$group": {"_id": "$candidate_id", "votes": {"$sum": 1}}},  # Group by candidate and count votes
-            {"$lookup": {
-                "from": "candidates",  # Join with candidates collection
-                "localField": "_id",  # Use the candidate_id from votes
-                "foreignField": "_id",  # Match it with the _id in the candidates collection
-                "as": "candidate_details"  # Store matched candidate details in 'candidate_details'
-            }},
-            {"$unwind": "$candidate_details"},  # Flatten the candidate details
-            {"$project": {
-                "candidate_id": "$_id",
-                "votes": 1,
-                "name": "$candidate_details.name",  # Extract the candidate name
-                "image_url": "$candidate_details.image_url"  # Extract the candidate image URL
-            }},
-            {"$sort": {"votes": -1}}  # Sort by number of votes in descending order
-        ]))
+    # 🔹 Aggregation Pipeline to count votes per candidate per position
+    pipeline = [
+        {"$match": {"election_id": election_id}},  # Filter by election_id
+        {"$group": {
+            "_id": {"position": "$position", "candidate_id": "$candidate_id"},
+            "votes": {"$sum": 1}  # Count votes per candidate
+        }},
+        {"$sort": {"_id.position": 1, "votes": -1}},  # Sort by position and votes
+    ]
 
-        results[position] = candidates
+    aggregated_results = list(db.votes.aggregate(pipeline))
 
-    return results
+    # 🔹 Reformat results grouped by position
+    results_by_position = {}
+
+    for item in aggregated_results:
+        position = item["_id"]["position"]
+        candidate_id = str(item["_id"]["candidate_id"])  # Convert ObjectId to string
+        votes = item["votes"]
+
+        # Group candidates by position
+        if position not in results_by_position:
+            results_by_position[position] = []
+
+        results_by_position[position].append({
+            "position": position,
+            "candidate_id": candidate_id,
+            "votes": votes
+        })
+
+    return {"election_id": election_id, "results": results_by_position}
 
 
 @app.get("/election-results/{election_id}")
